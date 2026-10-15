@@ -7,3 +7,4 @@ data/
 /public/
 public_legacy/
 client/dist/
+!.env.example
