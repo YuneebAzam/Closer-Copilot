@@ -1,0 +1,366 @@
+import { useEffect, useState } from 'react'
+import { api, token } from './api'
+import type { Turn, CardData, Outcome, DiscoveryPillar } from './types'
+import { renderLineHtml } from './coaching'
+
+type State = {
+  active: boolean
+  status: string
+  srvOn: boolean
+  dealId: string | null
+  productId: string | null
+  brief: string | null
+  battlePlan: string | null
+  // how this buyer buys, carried in from previous calls — null on a first call
+  buyer: { read: string; moves: string; stalls: string; signals: string } | null
+  clientName: string | null
+  productName: string | null
+  goalLabel: string | null
+  transcript: Turn[]
+  cards: CardData[]
+  streaming: CardData | null
+  discovery: DiscoveryPillar[] | null   // live discovery/MEDDPICC checklist
+  signal: { tag: string; hint: string } | null   // instant lane: live read while prospect talks
+  interim: string
+  awaitingOutcome: boolean   // capture stopped, End Call modal should show
+  // ---- cold call sprint ----
+  // One capture session, many dials, no client attached until one is earned.
+  sprint: { dial: number; stats: SprintStats } | null
+  // set when the coach hears a time get agreed — drives the "add as client?" prompt
+  appointment: Appointment | null
+}
+
+export type SprintStats = { dials: number; connects: number; appointments: number; clients: number }
+export type Appointment = { dial: number; when: string; name: string; company: string; phone: string; note: string }
+
+const state: State = {
+  active: false, status: '', srvOn: false,
+  dealId: null, productId: null, brief: null, battlePlan: null, buyer: null, clientName: null, productName: null,
+  goalLabel: null,
+  transcript: [], cards: [], streaming: null, discovery: null, signal: null, interim: '', awaitingOutcome: false,
+  sprint: null, appointment: null,
+}
+
+const listeners = new Set<() => void>()
+const emit = () => listeners.forEach((fn) => fn())
+
+let ev: WebSocket | null = null
+let socks: WebSocket[] = []
+let recs: MediaRecorder[] = []
+let streams: MediaStream[] = []
+let pipWin: Window | null = null
+
+const wsUrl = (p: string) => (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + p
+
+// System audio from a DESKTOP app (a softphone, Zoom, Teams) needs "Entire Screen" plus the
+// share-system-audio tick. That path is Chrome 74+ on Windows, but on macOS it only arrived in
+// Chrome 141 / macOS 14.2. Say so BEFORE the picker rather than letting a rep discover it
+// mid-sprint, stare at a greyed-out checkbox, and blame the product.
+function systemAudioSupport(): { ok: boolean; note: string } {
+  const ua = navigator.userAgent
+  const mac = /Macintosh|Mac OS X/.test(ua)
+  const m = ua.match(/Chrom(?:e|ium)\/(\d+)/)
+  const chrome = m ? parseInt(m[1], 10) : 0
+  if (!chrome) return { ok: false, note: 'Desktop-app audio needs Chrome or Edge. In another browser, dial from a browser tab instead and share that tab.' }
+  if (mac && chrome < 141) return { ok: false, note: 'On this Mac, Chrome ' + chrome + ' cannot capture desktop-app audio (needs Chrome 141+ and macOS 14.2+). Dial from a browser tab and share the tab, or update Chrome.' }
+  if (mac) return { ok: true, note: 'On macOS this needs macOS 14.2 or newer — if "Share system audio" is greyed out, dial from a browser tab instead.' }
+  return { ok: true, note: '' }
+}
+
+// Shared by a normal call and a sprint. Both need exactly the same two channels; the only
+// thing that differs is what got loaded before it.
+async function beginCapture() {
+  const cap = systemAudioSupport()
+  state.status = 'Allow the mic, then share where the call is: a browser dialer → that tab with "Also share tab audio"; a desktop dialer → Entire Screen with "Share system audio"…'
+  emit()
+
+  const mic = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } })
+  // The shared stream is already a clean digital feed. The browser's mic-oriented processing
+  // (echo cancellation, noise suppression, auto gain) is tuned for a room and a microphone, and
+  // on compressed speech it removes detail the transcriber needs. Turn it off for this channel.
+  const disp = await navigator.mediaDevices.getDisplayMedia({
+    video: true,
+    audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false },
+  })
+  if (!disp.getAudioTracks().length) {
+    mic.getTracks().forEach((t) => t.stop()); disp.getTracks().forEach((t) => t.stop())
+    throw new Error(
+      'No audio came through with that share. Browser dialer: pick the TAB and tick "Also share tab audio". ' +
+      'Desktop dialer: pick "Entire Screen" and tick "Share system audio". ' + (cap.note || '')
+    )
+  }
+  disp.getVideoTracks()[0].onended = () => { if (state.active) liveCall.stopCapture() }
+  streams = [mic, disp]
+  await connectEvents()
+  const t = await token()
+  pipe(mic, 'me', t!)
+  pipe(new MediaStream(disp.getAudioTracks()), 'prospect', t!)
+  state.active = true
+  state.status = 'Live — listening on both channels.' + (cap.note ? ' ' + cap.note : '')
+  emit()
+}
+
+function pushTurn(ch: 'me' | 'prospect', text: string) {
+  const last = state.transcript[state.transcript.length - 1]
+  if (last && last.ch === ch) last.text += ' ' + text
+  else state.transcript = [...state.transcript, { ch, text }]
+  state.interim = ''
+  emit()
+}
+function pushCard(c: CardData & { done: boolean }) {
+  if (!c.done) state.streaming = { tone: c.tone, line: c.line, why: '', technique: '' }
+  else { state.streaming = null; if (c.line) state.cards = [...state.cards, { ...c, used: null }] }
+  emit()
+  updatePip(c)
+}
+
+async function connectEvents() {
+  if (ev && (ev.readyState === 0 || ev.readyState === 1)) return
+  const t = await token()
+  if (!t) return
+  ev = new WebSocket(wsUrl('/events?t=' + encodeURIComponent(t)))
+  ev.onopen = () => { state.srvOn = true; emit() }
+  ev.onclose = () => { state.srvOn = false; emit(); if (state.active) setTimeout(connectEvents, 1500) }
+  ev.onmessage = (m) => {
+    const d = JSON.parse(m.data)
+    if (d.type === 'transcript') pushTurn(d.ch, d.text)
+    else if (d.type === 'interim') { state.interim = (d.ch === 'me' ? 'ME: ' : 'PROSPECT: ') + d.text; emit() }
+    else if (d.type === 'card-stream') pushCard(d)
+    // the card ships as soon as the LINE is ready; its why/technique land a beat later
+    else if (d.type === 'card-meta') {
+      state.cards = state.cards.map((c) => c.id === d.id ? { ...c, why: d.why, technique: d.technique, confidence: d.confidence } : c)
+      emit()
+    }
+    else if (d.type === 'signal') { state.signal = d.tag ? { tag: d.tag, hint: d.hint } : null; emit(); updatePipSignal() }
+    else if (d.type === 'discovery') { state.discovery = d.pillars; emit() }
+    else if (d.type === 'status') { state.status = d.msg; emit() }
+    // a time just got agreed — surface the prompt, but never interrupt the card lane
+    else if (d.type === 'appointment') {
+      state.appointment = { dial: d.dial, when: d.when, name: d.name, company: d.company, phone: d.phone, note: d.note }
+      emit()
+    }
+    // next dial: wipe the board so one prospect's context never bleeds into the next stranger
+    else if (d.type === 'sprint-reset') {
+      state.sprint = { dial: d.dial, stats: d.stats }
+      state.transcript = []; state.cards = []; state.streaming = null
+      state.discovery = null; state.signal = null; state.interim = ''
+      state.appointment = null
+      emit()
+    }
+  }
+}
+
+// How often the recorder hands us audio. This is dead latency on every single card: at 250ms the
+// prospect's last words sat in the browser for up to a quarter second before they were even sent.
+// 100ms costs a few more (tiny) websocket frames and buys that time back.
+const CHUNK_MS = 100
+
+function pipe(stream: MediaStream, ch: 'me' | 'prospect', t: string) {
+  let ws: WebSocket
+  // The prospect's audio has ALREADY been compressed once by Meet, so re-encoding it at 64k stacks
+  // a second generation of loss on the channel we can least afford to lose — that transcript is
+  // what the coach reads. Give that channel more headroom; the mic is a clean local source.
+  const rec = new MediaRecorder(stream, {
+    mimeType: 'audio/webm;codecs=opus',
+    audioBitsPerSecond: ch === 'prospect' ? 128000 : 64000,
+  })
+  rec.ondataavailable = (e) => { if (e.data.size && ws && ws.readyState === 1) e.data.arrayBuffer().then((b) => ws.send(b)) }
+  // Auto-reconnect: if the audio socket drops mid-call (server redeploy, network blip), the
+  // MediaRecorder keeps running but sends would silently fail — reopen and keep streaming.
+  const connect = () => {
+    ws = new WebSocket(wsUrl('/audio?ch=' + ch + '&t=' + encodeURIComponent(t)))
+    ws.onopen = () => { if (rec.state === 'inactive') rec.start(CHUNK_MS) }
+    ws.onclose = () => { if (state.active) setTimeout(connect, 800) }
+    socks.push(ws)
+  }
+  connect()
+  recs.push(rec)
+}
+
+function stopMedia() {
+  recs.forEach((r) => { try { if (r.state !== 'inactive') r.stop() } catch { /* noop */ } })
+  socks.forEach((w) => { try { w.close() } catch { /* noop */ } })
+  streams.forEach((s) => s.getTracks().forEach((t) => t.stop()))
+  recs = []; socks = []; streams = []
+}
+
+// api() returns r.json() without ever looking at r.ok, so a refusal from the server
+// arrives as an ordinary object and start() would sail straight past it into
+// beginCapture(). That is how /api/call/start could answer 402 "Out of credits" and the
+// call would start regardless. Refusing to start a call is only worth something if the
+// client actually stops. NewCall catches this and shows the message.
+function refuse(r: any) { if (r && r.error) throw new Error(r.error) }
+
+export const liveCall = {
+  get: () => state,
+  subscribe(fn: () => void) { listeners.add(fn); return () => listeners.delete(fn) },
+
+  // ---- cold call sprint ----
+  // Dial after dial on one capture session. No client is attached up front, because on cold
+  // outbound the client does not exist yet — that is the whole point of the mode.
+  async startSprint(productId: string) {
+    const r = await api<{ productName: string | null; goalLabel?: string }>(
+      '/api/call/start', { productId, goal: 'cold_sprint' })
+    refuse(r)
+    state.productName = r.productName
+    state.goalLabel = r.goalLabel || null
+    const sp = await api<{ dial: number; stats: SprintStats }>('/api/sprint/start', {})
+    state.sprint = { dial: sp.dial, stats: sp.stats }
+    state.dealId = null; state.productId = productId
+    state.brief = null; state.battlePlan = null; state.buyer = null; state.clientName = null
+    state.transcript = []; state.cards = []; state.streaming = null
+    state.discovery = null; state.signal = null; state.interim = ''
+    state.appointment = null; state.awaitingOutcome = false
+    emit()
+    // Capture is shared with a normal call: same two channels, one share for the WHOLE sprint.
+    // The picker appears once, not once per dial — being re-prompted every dial would make the
+    // mode unusable at 10-20 dials a day.
+    await beginCapture()
+  },
+
+  // Hang up, dial the next one. The server wipes the transcript; the sprint-reset event
+  // clears this side, so the two can never drift out of step.
+  async nextDial(connected?: boolean) {
+    const r = await api<{ dial: number; stats: SprintStats }>('/api/sprint/next', { connected })
+    state.sprint = { dial: r.dial, stats: r.stats }
+    emit()
+  },
+
+  // The "yes, add this one" tap. The ONLY path that writes a client during a sprint.
+  async addClient(f: { name: string; company: string; phone: string; when: string; note: string }) {
+    const r = await api<{ dealId: string; meetingId: string | null; name: string; stats: SprintStats }>(
+      '/api/sprint/convert', f)
+    if (state.sprint) state.sprint = { ...state.sprint, stats: r.stats }
+    state.appointment = null
+    state.status = 'Added ' + r.name + ' — Client Brain seeded from this call.'
+    emit()
+    return r
+  },
+
+  // Dismiss without adding. Deliberately does not re-prompt on this dial: a popup the closer
+  // already said no to is worse the second time.
+  dismissAppointment() { state.appointment = null; emit() },
+
+  async endSprint() {
+    const r = await api<{ stats: (SprintStats & { minutes: number }) | null }>('/api/sprint/end', {})
+    state.sprint = null; state.appointment = null; state.goalLabel = null
+    emit()
+    return r.stats
+  },
+
+  async start(dealId: string, productId: string, goal?: string) {
+    const r = await api<{ brief: string | null; battlePlan: string | null; buyer: State['buyer']; clientName: string | null; productName: string | null; goalLabel?: string }>(
+      '/api/call/start', { dealId, productId, goal })
+    refuse(r)
+    state.brief = r.brief; state.battlePlan = r.battlePlan; state.buyer = r.buyer || null
+    state.clientName = r.clientName; state.productName = r.productName
+    state.goalLabel = r.goalLabel || null
+    state.transcript = []; state.cards = []; state.streaming = null; state.discovery = null; state.signal = null; state.interim = ''; state.awaitingOutcome = false
+    state.dealId = dealId; state.productId = productId
+    await beginCapture()
+  },
+
+  /** Stop capturing audio immediately (End Call was clicked) — the outcome modal
+   *  shows next; the actual save + Client Brain analysis happens in finish(). */
+  stopCapture() {
+    if (!state.active) return
+    stopMedia()
+    state.active = false; state.awaitingOutcome = true
+    state.status = 'Call ended — one quick question before we save it…'
+    emit()
+  },
+
+  /** Submit the outcome (or skip) and run the post-call analysis + save. */
+  async finish(meta: { outcome?: Outcome; savedDeal?: boolean; savedDealNote?: string; outcomeAmount?: number; outcomeReason?: string } = {}) {
+    state.awaitingOutcome = false
+    state.status = 'Analyzing & saving the Client Brain…'; emit()
+    const r = await api<{ dealId?: string }>('/api/call/end', meta)
+    return r.dealId ?? null
+  },
+
+  /** Cancel without saving (used if the call never really started / no transcript). */
+  discard() {
+    stopMedia()
+    state.active = false; state.awaitingOutcome = false
+    emit()
+  },
+
+  sim() { api('/simulate', {}) },
+
+  rateCard(id: number | undefined, used: boolean) {
+    if (id === undefined) return
+    const card = state.cards.find((c) => c.id === id)
+    if (card) { card.used = used; emit() }
+    api('/api/card-feedback', { id, used })
+  },
+
+  async overlay() {
+    if (pipWin) { pipWin.focus(); return }
+    const dpip = (window as any).documentPictureInPicture
+    if (!dpip) { alert('Overlay needs Chrome 116+.'); return }
+    pipWin = await dpip.requestWindow({ width: 620, height: 240 })
+    const b = pipWin!.document.body
+    b.style.cssText = 'margin:0;background:#fff;color:#16181d;font:15px/1.5 Inter,system-ui,sans-serif;overflow:hidden;border-top:3px solid hsl(214 95% 52%)'
+    // two lanes: #ps = instant live read (while the prospect talks), #pc = the considered line
+    b.innerHTML =
+      '<div id="ps" style="display:none;padding:8px 18px;border-bottom:1px solid #eef0f3;background:#fafbfc"></div>' +
+      '<div id="pc" style="padding:14px 18px;color:#77839a">Overlay live — your line appears here, on top of everything.</div>'
+    pipWin!.addEventListener('pagehide', () => { pipWin = null })
+    updatePipSignal()
+    if (state.streaming || state.cards.length) updatePip((state.streaming || state.cards[state.cards.length - 1]) as any)
+  },
+}
+
+// Must cover every tag in server.js MOMENTS — DIY, CONTRACT and TRUST were already being emitted
+// with no entry here, so they fell through to the grey default and read as "unknown" rather than as
+// the distinct moments they are. Red flags share one colour: they mean the same thing to the closer
+// (this deal may not be real yet), so they should not need decoding.
+const SIGNAL_COLORS: Record<string, string> = {
+  PRICE: 'hsl(214 95% 52%)', BUYING: '#15803d', OBJECTION: '#b45309',
+  STALL: '#b45309', COMPETITOR: '#7c3aed', DIY: '#7c3aed', CONTRACT: '#b45309',
+  TRUST: '#be123c', VAGUE: '#be123c', NO_AUTHORITY: '#be123c',
+}
+
+function updatePipSignal() {
+  if (!pipWin) return
+  const ps = pipWin.document.getElementById('ps')
+  if (!ps) return
+  const sig = state.signal
+  if (!sig) { ps.style.display = 'none'; ps.innerHTML = ''; return }
+  const color = SIGNAL_COLORS[sig.tag] || '#475569'
+  ps.style.display = 'block'
+  ps.innerHTML =
+    '<span style="display:inline-block;font-size:10px;font-weight:800;letter-spacing:.5px;color:#fff;background:' +
+    color + ';border-radius:5px;padding:2px 8px;margin-right:8px;text-transform:uppercase">' + sig.tag +
+    '</span><span style="font-size:13px;color:#475569">' + sig.hint + '</span>'
+}
+
+function updatePip(c: { tone: string; line: string }) {
+  if (!pipWin) return
+  const pc = pipWin.document.getElementById('pc')
+  if (!pc) return
+  const silent = /silent/i.test(c.tone)
+  const line = renderLineHtml(c.line)
+    .replace(/class="cl-pause-long"/g, 'style="color:hsl(214 95% 52%);font-weight:800;font-size:12px;background:hsl(214 95% 94%);border-radius:5px;padding:2px 7px"')
+    .replace(/class="cl-pause"/g, 'style="color:hsl(214 95% 52%);font-weight:800;padding:0 3px"')
+    .replace(/class="cl-cue cl-body"/g, 'style="font-size:12px;color:hsl(214 80% 42%);background:hsl(214 95% 94%);border-radius:5px;padding:1px 8px;margin:0 3px"')
+    .replace(/class="cl-cue"/g, 'style="font-size:12px;font-style:italic;color:#475569;background:#eef0f3;border-radius:5px;padding:1px 8px;margin:0 3px"')
+    .replace(/class="cl-down"/g, 'style="color:hsl(214 95% 52%)"')
+    .replace(/class="cl-up"/g, 'style="color:#b45309"')
+  // The tone sits at the HEAD OF THE SENTENCE, not on a row above it. On its own line the eye
+  // goes straight to the big text and skips it — the closer told us he was never reading it. One
+  // line of sight, register first, because there is under two seconds before the silence is heard.
+  pc.innerHTML =
+    '<div style="padding:12px 18px;font-size:22px;font-weight:600;line-height:1.55">' +
+    '<span style="font-size:13px;font-weight:800;letter-spacing:.08em;text-transform:uppercase;color:#fff;background:' +
+    (silent ? '#b45309' : 'hsl(214 95% 52%)') +
+    ';border-radius:5px;padding:3px 9px;margin-right:9px;white-space:nowrap;vertical-align:middle">' +
+    (c.tone || '…') + '</span>' + line + '</div>'
+}
+
+// React binding
+export function useLiveCall() {
+  const [, force] = useState(0)
+  useEffect(() => liveCall.subscribe(() => force((n) => n + 1)), [])
+  return { state: liveCall.get(), live: liveCall }
+}

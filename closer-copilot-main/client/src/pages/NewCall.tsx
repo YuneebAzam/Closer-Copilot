@@ -1,0 +1,154 @@
+import { useEffect, useState } from 'react'
+import { useNavigate, useSearchParams } from 'react-router-dom'
+import { api } from '@/lib/api'
+import { pickProduct } from '@/lib/pickProduct.js'
+import type { Product, ClientRow, GoalOption } from '@/lib/types'
+import { liveCall } from '@/lib/liveCall'
+import { Button } from '@/components/ui/button'
+import { Input } from '@/components/ui/input'
+import { PageSkeleton } from '@/components/Skeleton'
+
+const selectCls = 'flex h-10 w-full rounded-md border border-input bg-card px-3 text-sm focus-visible:outline-none focus-visible:border-primary focus-visible:ring-2 focus-visible:ring-primary/25'
+
+export default function NewCall() {
+  const [products, setProducts] = useState<Product[]>([])
+  const [clients, setClients] = useState<ClientRow[]>([])
+  const [goals, setGoals] = useState<GoalOption[]>([])
+  const [ready, setReady] = useState(false)
+  const [productId, setProductId] = useState('')
+  const [clientId, setClientId] = useState('')
+  const [goal, setGoal] = useState('')
+  const [ncName, setNcName] = useState('')
+  const [ncCompany, setNcCompany] = useState('')
+  const [msg, setMsg] = useState('')
+  const [busy, setBusy] = useState(false)
+  const navigate = useNavigate()
+  const [params] = useSearchParams()
+
+  useEffect(() => {
+    Promise.all([
+      api<{ products: Product[] }>('/api/products'),
+      api<{ clients: ClientRow[] }>('/api/clients'),
+      fetch('/api/config').then((r) => r.json()),
+    ]).then(([p, c, cfg]) => {
+      setProducts(p.products || []); setClients(c.clients || [])
+      setGoals(cfg.goals || [])
+      const pre = params.get('client')
+      const preClient = pre ? (c.clients || []).find((x) => x.id === pre) : undefined
+      setClientId(preClient ? pre! : '')
+      setProductId(pickProduct(params.get('product'), preClient?.product_id, p.products))
+      const preGoal = params.get('goal')
+      if (preGoal && (cfg.goals || []).some((g: GoalOption) => g.id === preGoal)) setGoal(preGoal)
+      setReady(true)
+    })
+  }, [])
+
+  // switching client re-points the playbook at whatever was sold to them before. Same resolver,
+  // so the two paths can never drift apart — but keep the current pick if that client has no
+  // history, rather than yanking the dropdown back to products[0].
+  const pickClient = (id: string) => {
+    setClientId(id)
+    const prev = clients.find((c) => c.id === id)?.product_id
+    setProductId(pickProduct(prev, productId, products))
+  }
+
+  const start = async () => {
+    setBusy(true); setMsg('')
+    try {
+      if (!goal) { setMsg('Pick the goal of this call — it changes how the coach plays it.'); setBusy(false); return }
+      // A cold sprint has no client by definition — that is the point of it. Skip the client
+      // step entirely; one gets created only if a dial actually books something.
+      if (goal === 'cold_sprint') {
+        await liveCall.startSprint(productId)
+        navigate('/live')
+        return
+      }
+      let dealId = clientId
+      if (!dealId) {
+        if (!ncName.trim()) { setMsg('Enter a client name or pick one.'); setBusy(false); return }
+        const r = await api<{ client: { id: string } }>('/api/clients', { name: ncName.trim(), company: ncCompany.trim() })
+        dealId = r.client.id
+      }
+      await liveCall.start(dealId, productId, goal)
+      navigate('/live')
+    } catch (e: any) { setMsg(e.message); setBusy(false) }
+  }
+
+  // Every field on this page is either fetched or derived from the `?client=` query param
+  // (pickProduct/pickClient). Rendering before that resolves means an empty playbook dropdown,
+  // "+ New client..." instead of the real one, and the new-client-name fields popping in —
+  // then vanishing a moment later once the real selection lands. Wait for it instead.
+  if (!ready) return <PageSkeleton />
+
+  if (products.length === 0) {
+    return (
+      <div className="mx-auto max-w-[560px] px-8 py-7">
+        <h2 className="mb-3 text-xl font-bold tracking-tight">New Call</h2>
+        <div className="rounded-xl border border-border bg-card p-6">
+          <p className="mb-4 text-sm">You need at least one <b>playbook</b> (what you're selling) before starting a call.</p>
+          <Button onClick={() => navigate('/playbooks/new')}>Create your first playbook</Button>
+        </div>
+      </div>
+    )
+  }
+
+  return (
+    <div className="mx-auto max-w-[640px] px-8 py-7">
+      <h2 className="mb-5 text-xl font-bold tracking-tight">New Call</h2>
+      <div className="rounded-xl border border-border bg-card p-6">
+        <div className="grid gap-4 sm:grid-cols-2">
+          <div>
+            <div className="mb-1.5 text-xs font-medium text-muted-foreground">Which playbook are you selling?</div>
+            <select className={selectCls} value={productId} onChange={(e) => setProductId(e.target.value)}>
+              {products.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
+            </select>
+          </div>
+          <div>
+            <div className="mb-1.5 text-xs font-medium text-muted-foreground">Client</div>
+            <select className={selectCls} value={clientId} onChange={(e) => pickClient(e.target.value)}>
+              <option value="">+ New client…</option>
+              {clients.map((c) => <option key={c.id} value={c.id}>{c.name}{c.company ? ` — ${c.company}` : ''} ({c.calls})</option>)}
+            </select>
+          </div>
+        </div>
+
+        <div className="mt-4">
+          <div className="mb-1.5 text-xs font-medium text-muted-foreground">What's the goal of this call?</div>
+          <select className={selectCls} value={goal} onChange={(e) => setGoal(e.target.value)}>
+            <option value="">Pick a goal…</option>
+            {goals.map((g) => <option key={g.id} value={g.id}>{g.label}</option>)}
+          </select>
+          <p className="mt-1.5 text-[12px] leading-snug text-muted-foreground">
+            {goal === 'cold_sprint'
+              ? 'Sprint mode: no client needed. The coach stays on between dials, and asks whether to add a client only when it hears you book a time.'
+              : 'The coach plays for this goal — on a discovery call it digs for pain instead of pushing the close.'}
+          </p>
+        </div>
+
+        {!clientId && goal !== 'cold_sprint' && (
+          <div className="mt-3 grid gap-4 sm:grid-cols-2">
+            <div>
+              <div className="mb-1.5 text-xs font-medium text-muted-foreground">New client name</div>
+              <Input value={ncName} onChange={(e) => setNcName(e.target.value)} placeholder="Person on the call" />
+            </div>
+            <div>
+              <div className="mb-1.5 text-xs font-medium text-muted-foreground">Company (optional)</div>
+              <Input value={ncCompany} onChange={(e) => setNcCompany(e.target.value)} placeholder="Their company" />
+            </div>
+          </div>
+        )}
+
+        <div className="mt-4 rounded-lg border border-primary/20 bg-primary/5 px-3.5 py-3 text-[13px] leading-snug text-foreground/80">
+          Tip: at the start of the call, say <i>"I use an AI assistant that transcribes our conversation — is that okay?"</i>{' '}
+          Then share wherever the call audio is: a <b>browser dialer or Meet/Zoom in a tab</b> → share that <b>tab</b> with <b>"Also share tab audio"</b>;
+          a <b>desktop dialer, Zoom or Teams app</b> → share <b>Entire Screen</b> with <b>"Share system audio"</b>. Use a headset either way.
+        </div>
+
+        <div className="mt-5 flex items-center gap-3">
+          <Button size="lg" disabled={busy} onClick={start}>Start Call</Button>
+          {msg && <span className="text-sm text-muted-foreground">{msg}</span>}
+        </div>
+      </div>
+    </div>
+  )
+}

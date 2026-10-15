@@ -1,0 +1,216 @@
+import { useEffect, useLayoutEffect, useRef, useState } from 'react'
+import { sb } from '@/lib/supabase'
+import { Button } from '@/components/ui/button'
+import { Input } from '@/components/ui/input'
+import { Label } from '@/components/ui/label'
+import { CoachingCard } from '@/lib/coaching'
+
+// Each scene pairs an objection with the headline that names it, so the copy narrates
+// whatever the demo is showing rather than rotating independently beside it.
+const SCENES = [
+  {
+    headline: 'Never flinch when they push back on price.',
+    prospect: 'Honestly, fourteen hundred is a lot right now.',
+    tone: 'CALM · slow',
+    line: "I hear you, |||| most owners said the same… ↘ until they counted the *missed* calls.",
+  },
+  {
+    headline: 'Know exactly what to say, every time.',
+    prospect: 'I already have an answering service.',
+    tone: 'CURIOUS · genuine',
+    line: "Totally fair, || what does yours do when a *job's* on the line? ↗",
+  },
+  {
+    headline: 'Turn “let me think about it” into “yes”.',
+    prospect: 'Let me run it by my brother first.',
+    tone: 'WARM · slower',
+    line: "Of course, || is it the *price* you're weighing, || or whether it'll work? ↗",
+  },
+]
+const SCENE_MS = 6000   // long enough to read the coached line AND absorb the new headline
+const CARD_DELAY_MS = 1100
+
+// Landscape live-call demo: transcript stacks above, the coached line (real CoachingCard,
+// same delivery-mark rendering as the live product) sits below in the same window, one
+// card telling the whole story, not two cards split apart.
+// Presentational only — the scene clock lives in Landing so the headline stays in lockstep
+function CoachDemo({ i, showCard }: { i: number; showCard: boolean }) {
+  const s = SCENES[i]
+
+  return (
+    <div className="relative w-full max-w-[1080px] animate-float">
+      <div className="absolute -inset-8 rounded-[32px] bg-primary/[0.14] blur-[60px]" />
+      <div className="absolute inset-0 translate-x-3 translate-y-4 rounded-2xl border border-black/5 bg-white/70 shadow-xl" />
+      <div className="relative w-full overflow-hidden rounded-2xl border border-black/[0.07] bg-white shadow-[0_30px_70px_-20px_rgba(20,45,90,0.30)]">
+        <div className="flex items-center gap-2 border-b border-black/5 bg-[#f4f5f7] px-4 py-2.5">
+          <span className="h-2.5 w-2.5 rounded-full bg-[#ff5f57]" />
+          <span className="h-2.5 w-2.5 rounded-full bg-[#febc2e]" />
+          <span className="h-2.5 w-2.5 rounded-full bg-[#28c840]" />
+          <span className="ml-2 text-[14px] font-medium text-slate-500">Live Call · Mike Torres</span>
+          <span className="ml-auto flex items-center gap-1.5 text-[12.5px] font-semibold text-red-500"><span className="h-2 w-2 animate-pulse rounded-full bg-red-500" /> live</span>
+        </div>
+        <div className="flex min-h-[400px] flex-col gap-3.5 bg-[#f8f9fb] p-5">
+          <div className="ml-auto max-w-[56%] rounded-xl border border-primary/20 bg-primary/5 px-4 py-3 text-[16px] leading-snug text-slate-700">
+            <span className="mb-1 block text-[11.5px] font-bold uppercase tracking-wider text-primary">Me</span>
+            So with setup it's fourteen hundred, all in.
+          </div>
+          <div key={`p${i}`} className="max-w-[56%] animate-fade-up rounded-xl border border-amber-500/20 bg-amber-500/5 px-4 py-3 text-[16px] leading-snug text-slate-700">
+            <span className="mb-1 block text-[11.5px] font-bold uppercase tracking-wider text-amber-700">Prospect</span>
+            {s.prospect}
+          </div>
+          {/* mt-auto anchors the coached line to the bottom of the window, so the reserved
+              space reads as a deliberate gap between "what they said" and "what you say"
+              instead of an empty hole before the card fades in */}
+          {showCard && (
+            <div key={`c${i}`} className="mt-auto animate-fade-up">
+              <CoachingCard tone={s.tone} line={s.line} size="lg" />
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  )
+}
+
+const chips = ['Live whisper', 'Deal memory', 'Your playbooks']
+
+// The whole page force-locks to light theme below (see useLayoutEffect in Landing), so the
+// mark never needs to theme-swap here, always the blue variant, no dark asset to load.
+function Wordmark() {
+  return (
+    <div className="flex items-center gap-2.5">
+      <img src="/brand/mark-blue.png" alt="Closer Copilot" className="h-[34px] w-[34px]" />
+      <span className="font-display text-[23px] font-semibold tracking-tight">Closer <span className="font-extrabold">Copilot</span></span>
+    </div>
+  )
+}
+
+export default function Landing() {
+  const [email, setEmail] = useState('')
+  const [pass, setPass] = useState('')
+  const [msg, setMsg] = useState<{ t: string; ok?: boolean }>({ t: '' })
+  const [busy, setBusy] = useState<'in' | 'up' | null>(null)
+  const emailRef = useRef<HTMLInputElement>(null)
+
+  // One clock drives both the rotating headline and the demo scene
+  const [scene, setScene] = useState(0)
+  const [showCard, setShowCard] = useState(false)
+  useEffect(() => {
+    setShowCard(false)
+    const t1 = setTimeout(() => setShowCard(true), CARD_DELAY_MS)
+    const t2 = setTimeout(() => setScene((x) => (x + 1) % SCENES.length), SCENE_MS)
+    return () => { clearTimeout(t1); clearTimeout(t2) }
+  }, [scene])
+
+  // The header link is wayfinding, not a second signup path: it brings the card into view
+  // (it sits below the fold on small screens) and drops the cursor in the first field, so
+  // there's still exactly one "Create an account" action, down in the card.
+  const goToSignUp = () => {
+    emailRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' })
+    emailRef.current?.focus({ preventScroll: true })
+  }
+
+  // This is a fixed light-brand surface (the demo mockup and hero glow were built as one
+  // consistent light look), lock it regardless of the app's dark-mode preference, which
+  // resumes normally once signed in. Restores whatever was there on unmount.
+  useLayoutEffect(() => {
+    const root = document.documentElement
+    const hadDark = root.classList.contains('dark')
+    root.classList.remove('dark')
+    return () => { if (hadDark) root.classList.add('dark') }
+  }, [])
+
+  const signIn = async () => {
+    setBusy('in'); setMsg({ t: '' })
+    const { error } = await sb.auth.signInWithPassword({ email: email.trim(), password: pass })
+    setBusy(null); if (error) setMsg({ t: error.message })
+  }
+  const signUp = async () => {
+    setBusy('up'); setMsg({ t: '' })
+    const { data, error } = await sb.auth.signUp({ email: email.trim(), password: pass })
+    setBusy(null); if (error) return setMsg({ t: error.message })
+    if (!data.session) setMsg({ t: 'Account created, check your email to confirm, then sign in.', ok: true })
+  }
+
+  return (
+    // One shared canvas (no hard divider between a "hero side" and a "form side"), both
+    // the demo card and the sign-in card float on the same gradient, which is what makes it
+    // read as one designed page instead of two panels stitched together.
+    <div className="relative flex min-h-[100dvh] flex-col bg-gradient-to-br from-[#d9e7fc] via-[#eef4fe] to-[#d6e5fb] px-6 py-7 md:px-12">
+      <div
+        className="pointer-events-none absolute inset-0 opacity-60"
+        style={{ backgroundImage: 'radial-gradient(rgba(15,45,90,0.10) 1px, transparent 1px)', backgroundSize: '22px 22px' }}
+      />
+
+      <div className="relative z-10 mx-auto flex w-full max-w-[1700px] items-center justify-between gap-4">
+        <Wordmark />
+        <button onClick={goToSignUp} className="text-[13px] text-muted-foreground transition-colors hover:text-foreground">
+          New here? <span className="font-medium text-primary">Create an account</span>
+        </button>
+      </div>
+
+      {/* my-auto (not items-center) centers the block vertically while staying scroll-safe:
+          if the content ever exceeds the viewport it grows downward instead of clipping the top */}
+      <div className="relative z-10 mx-auto my-auto flex w-full max-w-[1700px] flex-col items-center gap-8 py-8 lg:flex-row lg:items-center lg:justify-between lg:gap-14">
+        {/* MAIN: headline + live demo, the pitch, delivered in ~2 seconds */}
+        <div className="flex w-full min-w-0 flex-1 flex-col items-center text-center lg:items-start lg:text-left">
+          {/* min-height reserves room for the longest headline so swapping copy never
+              shoves the demo card up and down. key= re-triggers the fade on each change. */}
+          <div className="flex min-h-[74px] items-center md:min-h-[100px] xl:min-h-[116px]">
+            <h1
+              key={scene}
+              className="animate-hero-in font-display text-[30px] font-extrabold leading-[1.1] tracking-[-0.02em] md:text-[42px] xl:text-[48px]"
+            >
+              {SCENES[scene].headline}
+            </h1>
+          </div>
+          <p className="animate-hero-in mt-3.5 max-w-xl text-[15px] text-muted-foreground md:text-[16.5px]" style={{ animationDelay: '90ms' }}>
+            It hears the objection and hands you the line, with the tone to say it in.
+          </p>
+          <div className="animate-hero-in mt-7 hidden w-full justify-center md:flex lg:justify-start" style={{ animationDelay: '180ms' }}>
+            <CoachDemo i={scene} showCard={showCard} />
+          </div>
+          <p className="animate-hero-in mt-6 flex items-center gap-2 text-[13px] font-medium text-foreground/70" style={{ animationDelay: '300ms' }}>
+            <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-primary" />
+            Built by an agency owner who closes on it every day
+          </p>
+          <p className="animate-hero-in mt-2 text-[12px] font-medium text-foreground/45" style={{ animationDelay: '360ms' }}>
+            {chips.map((c, i) => <span key={c}>{i > 0 && ' · '}{c}</span>)}
+          </p>
+        </div>
+
+        {/* SIGN IN, unchanged flow (sign-in first), just given the same floating-card depth
+            as the demo so both halves feel like one designed page */}
+        <div className="relative w-full max-w-[440px] shrink-0">
+          <div className="pointer-events-none absolute left-1/2 top-1/3 -z-10 h-[380px] w-[380px] -translate-x-1/2 -translate-y-1/2 rounded-full bg-primary/[0.06] blur-[100px]" />
+          <div className="rounded-2xl border border-border bg-card p-7 shadow-[0_1px_2px_rgba(16,24,40,0.04),0_16px_40px_-12px_rgba(16,24,40,0.10)]">
+            <h2 className="font-display text-[26px] font-extrabold tracking-tight">Welcome back</h2>
+            <p className="mt-1.5 text-sm text-muted-foreground">Sign in to your workspace.</p>
+
+            <div className="mt-7 space-y-4">
+              <div>
+                <Label htmlFor="email">Email</Label>
+                <Input ref={emailRef} id="email" type="email" autoComplete="email" placeholder="you@company.com" value={email} onChange={(e) => setEmail(e.target.value)} />
+              </div>
+              <div>
+                <Label htmlFor="pass">Password</Label>
+                <Input id="pass" type="password" autoComplete="current-password" placeholder="Your password" value={pass} onChange={(e) => setPass(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter') signIn() }} />
+              </div>
+              <Button className="w-full" size="lg" disabled={busy !== null} onClick={signIn}>{busy === 'in' ? 'Signing in…' : 'Sign in'}</Button>
+              <div className="flex items-center gap-3 py-1 text-xs text-muted-foreground">
+                <div className="h-px flex-1 bg-border" /><span>new here?</span><div className="h-px flex-1 bg-border" />
+              </div>
+              <Button className="w-full" size="lg" variant="outline" disabled={busy !== null} onClick={signUp}>{busy === 'up' ? 'Creating…' : 'Create an account'}</Button>
+              {msg.t && <p className={`text-[13px] ${msg.ok ? 'text-primary' : 'text-destructive'}`}>{msg.t}</p>}
+              <p className="pt-1 text-center text-xs leading-relaxed text-muted-foreground">
+                Backed by a 30-day guarantee: we measure your close rate together,
+                and if it doesn't improve, full refund.
+              </p>
+              <p className="pt-2 text-center text-[10.5px] text-muted-foreground/60">Owned by Vextria AI</p>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  )
+}
